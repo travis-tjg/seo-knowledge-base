@@ -3,6 +3,12 @@
 MCP Server for SEO Knowledge Base.
 
 Exposes the SEO knowledge base to Claude Desktop, VS Code, and other MCP clients.
+
+NOTE: All heavy imports (chromadb, llama_index, sentence_transformers, etc.)
+are done lazily inside tool functions. This is critical because the project
+lives on Google Drive, where importing large libraries can take 2+ minutes.
+Claude Desktop's MCP initialize timeout is 60 seconds, so the server must
+start quickly and defer heavy loading until a tool is actually called.
 """
 
 import sys
@@ -50,13 +56,75 @@ os.environ["SEO_KB_QUIET"] = "1"
 # Add project root to path
 sys.path.insert(0, str(__file__).rsplit("/", 1)[0])
 
+# Only import lightweight modules at startup - heavy deps are lazy-loaded
+import threading
+
 from mcp.server.fastmcp import FastMCP
-from src.query import query, get_query_engine
-from src.embeddings import get_embeddings_manager
-from config import DOMAINS
 
 # Initialize MCP server
 mcp = FastMCP("knowledge-base")
+
+# Lazy-loaded module references
+_query_func = None
+_get_embeddings_manager_func = None
+_domains = None
+_loading_lock = threading.Lock()
+_loading_started = False
+
+
+def _background_load():
+    """Pre-load heavy dependencies in background thread."""
+    global _query_func, _get_embeddings_manager_func, _domains
+    try:
+        sys.stderr.write("MCP: Background loading heavy dependencies...\n")
+        sys.stderr.flush()
+        from src.query import query as _q
+        from src.embeddings import get_embeddings_manager as _gem
+        from config import DOMAINS as _d
+        with _loading_lock:
+            _query_func = _q
+            _get_embeddings_manager_func = _gem
+            _domains = _d
+        sys.stderr.write("MCP: Background loading complete.\n")
+        sys.stderr.flush()
+    except Exception as e:
+        sys.stderr.write(f"MCP: Background loading failed: {e}\n")
+        sys.stderr.flush()
+
+
+def _start_background_load():
+    """Start background loading if not already started."""
+    global _loading_started
+    if _loading_started:
+        return
+    _loading_started = True
+    t = threading.Thread(target=_background_load, daemon=True)
+    t.start()
+
+
+def _ensure_loaded():
+    """Wait for heavy dependencies to be loaded."""
+    global _query_func, _get_embeddings_manager_func, _domains
+    # Start background load if not already running
+    _start_background_load()
+    # If already loaded, return immediately
+    if _query_func is not None:
+        return
+    # Otherwise, load synchronously (blocks until done)
+    sys.stderr.write("MCP: Waiting for dependencies to load...\n")
+    sys.stderr.flush()
+    from src.query import query as _q
+    from src.embeddings import get_embeddings_manager as _gem
+    from config import DOMAINS as _d
+    with _loading_lock:
+        _query_func = _q
+        _get_embeddings_manager_func = _gem
+        _domains = _d
+
+
+# Start pre-loading immediately in background so deps are ready
+# before the first tool call comes in
+_start_background_load()
 
 
 @mcp.tool()
@@ -79,9 +147,10 @@ def query_knowledge(question: str, domain: str = "auto") -> str:
         An answer with citations to source videos and timestamps
     """
     try:
+        _ensure_loaded()
         # Map domain parameter
         actual_domain = None if domain == "auto" else domain
-        result = query(question, domain=actual_domain)
+        result = _query_func(question, domain=actual_domain)
         return result
     except Exception as e:
         return f"Error querying knowledge base: {str(e)}"
@@ -102,7 +171,8 @@ def query_seo_knowledge(question: str) -> str:
         An answer with citations to source videos and timestamps
     """
     try:
-        result = query(question, domain="seo")
+        _ensure_loaded()
+        result = _query_func(question, domain="seo")
         return result
     except Exception as e:
         return f"Error querying knowledge base: {str(e)}"
@@ -121,7 +191,8 @@ def query_web_builder_knowledge(question: str) -> str:
         An answer with citations to source videos and timestamps
     """
     try:
-        result = query(question, domain="web_builder")
+        _ensure_loaded()
+        result = _query_func(question, domain="web_builder")
         return result
     except Exception as e:
         return f"Error querying knowledge base: {str(e)}"
@@ -138,10 +209,11 @@ def get_all_stats() -> str:
     - Collection name and embedding model
     """
     try:
+        _ensure_loaded()
         all_stats = {}
 
-        for domain_name, domain_config in DOMAINS.items():
-            manager = get_embeddings_manager(domain_name)
+        for domain_name, domain_config in _domains.items():
+            manager = _get_embeddings_manager_func(domain_name)
             stats = manager.get_stats()
             source_stats = manager.get_stats_by_source()
 
@@ -171,7 +243,8 @@ def get_knowledge_base_stats() -> str:
     Prefer using get_all_stats() to see all knowledge bases.
     """
     try:
-        manager = get_embeddings_manager("seo")
+        _ensure_loaded()
+        manager = _get_embeddings_manager_func("seo")
         stats = manager.get_stats()
         source_stats = manager.get_stats_by_source()
 
@@ -209,13 +282,14 @@ def search_raw_chunks(question: str, top_k: int = 5, domain: str = "seo") -> str
         JSON array of matching chunks with metadata (title, channel, timestamp, text)
     """
     try:
+        _ensure_loaded()
         # Clamp top_k
         top_k = max(1, min(20, top_k))
 
         # Determine domains to search
         if domain == "all":
-            domains_to_search = list(DOMAINS.keys())
-        elif domain in DOMAINS:
+            domains_to_search = list(_domains.keys())
+        elif domain in _domains:
             domains_to_search = [domain]
         else:
             domains_to_search = ["seo"]  # Default
@@ -223,7 +297,7 @@ def search_raw_chunks(question: str, top_k: int = 5, domain: str = "seo") -> str
         all_results = []
 
         for domain_name in domains_to_search:
-            manager = get_embeddings_manager(domain_name)
+            manager = _get_embeddings_manager_func(domain_name)
 
             # Check if we have content
             stats = manager.get_stats()
